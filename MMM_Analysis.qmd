@@ -1,0 +1,581 @@
+---
+title: "Masculinity, Meaning, and Misogyny: R Analysis"
+author: "Eli Cochrane"
+format: html
+embed-resources: true
+---
+
+This document contains the complete R pipeline for the LIWC/LPA/ITS analyses reported in *Masculinity, Meaning, and Misogyny: Linguistic Markers of Intra- and Intergroup Identity Threat Responses in r/JordanPeterson*. Input is `jpdata_fully_themed_0.0.csv`: the LIWC-22-scored corpus with BERTopic-derived themes assigned in a separate Python pipeline.
+
+Required packages: tidyverse, lubridate, tidyLPA, nlme.
+
+## Setup
+
+```{r}
+#| label: setup
+#| message: false
+
+library(tidyverse)
+library(lubridate)
+
+jp <- read_csv("jpdata_fully_themed_0.0.csv", show_col_types = FALSE) |>
+  filter(created_utc >= 1483228800) |>   # 2017-01-01
+  mutate(
+    id = str_extract(permalink, pattern = "(?<=/comments/)[^/]+"),
+    created = as_date(as_datetime(created_utc)),
+    month = floor_date(created, unit = "month"),
+    Theme_Specific = replace_na(Theme_Specific, "unsorted")
+  ) |>
+  relocate(id, .before = author) |>
+  relocate(month, .before = author) |>
+  select(-(c(created_utc, created, permalink, Segment))) |>
+  relocate(Theme_Specific, .before = score)
+```
+
+## Latent Profile Analysis
+
+### Indicator selection
+
+```{r}
+#| label: check-multicollinearity
+#| message: false
+
+indicator_check <- jp |>
+  select(i, we, shehe, they, power, certitude, emo_anger, emo_anx, insight, moral)
+
+print(round(cor(indicator_check, use = "pairwise.complete.obs"), 2))
+```
+
+### Prep vars
+
+Third-person singular and plural pronouns are combined into a single variable
+
+```{r}
+#| label: prep-lpa
+#| message: false
+
+jp_lpa <- jp |>
+  mutate(thirdp = shehe + they) |>
+  drop_na(i, we, thirdp, power, certitude, emo_anger, emo_anx, insight, moral) |>
+  select(i, we, thirdp, power, certitude, emo_anger, emo_anx, insight, moral) |>
+  scale() |>
+  as.data.frame()
+
+# These should match: no rows are lost to missingness
+cat("N, main dataset:", nrow(jp), "\n")
+cat("N, LPA input:   ", nrow(jp_lpa), "\n")
+```
+
+### Model selection
+
+Solutions with 1-10 profiles were compared on BIC, entropy, and minimum class; the 5-profile method was selected from this chunk. 
+
+```{r}
+#| label: lpa-model-selection
+#| message: false
+
+library(tidyLPA)
+
+full_theory_models <- jp_lpa |>
+  estimate_profiles(1:10)
+
+fit_stats <- get_fit(full_theory_models)
+print(fit_stats)
+
+fit_stats |>
+  ggplot(aes(x = Classes, y = BIC)) +
+  geom_line(color = "#2c3e50", linewidth = 1) +
+  geom_point(size = 3, color = "#e74c3c") +
+  scale_x_continuous(breaks = 1:10) +
+  theme_minimal() +
+  labs(title = "BIC by Number of Profiles", x = "Number of Profiles", y = "BIC")
+```
+
+### Fit the 5-profile model and assign classes
+
+```{r}
+#| label: lpa-assign
+#| message: false
+
+lpa_model_5 <- jp_lpa |>
+  estimate_profiles(5)
+
+lpa_results_5 <- get_data(lpa_model_5)
+
+jp <- jp |>
+  mutate(
+    LPA_5 = as.factor(lpa_results_5$Class),
+    Prob_5 = pmax(lpa_results_5$CPROB1, lpa_results_5$CPROB2, lpa_results_5$CPROB3,
+                  lpa_results_5$CPROB4, lpa_results_5$CPROB5)
+  ) |>
+  relocate(LPA_5, Prob_5, .after = month)
+
+table(jp$LPA_5)
+```
+
+### Label profiles and themes
+
+Profile names were assigned from class-level indicators (see Table 1 of the manuscript). `Power-Moral_Framing` is reported in the manuscript as "Impersonal Policing" because that name is more descriptive.
+
+```{r}
+#| label: label-profiles-themes
+#| message: false
+
+jp <- jp |>
+  mutate(
+    LPA_5 = fct_recode(LPA_5,
+      "Group_Baseline" = "1",
+      "Hostile_Reactivity" = "2",
+      "Anxious_Self-Focus" = "3",
+      "Power-Moral_Framing" = "4",
+      "Third-Person_Focus" = "5"),
+    Theme = fct_recode(Theme_Specific,
+      "Outgroups_LGBT" = "outgroups (lgbt)",
+      "Outgroups_Political" = "outgroups (political)",
+      "Outgroups_Women" = "outgroups (women)",
+      "Peterson" = "peterson",
+      "Philosophy" = "philosophy",
+      "Politics" = "politics",
+      "Psychology" = "psychology",
+      "Self-Help_Improvement" = "self-help (improvement)",
+      "Self-Help_Negative" = "self-help (negative)",
+      "Self-Help_Positive" = "self-help (positive)",
+      "Other" = "other")
+  )
+```
+
+### Descriptives (Table 1 source)
+
+```{r}
+#| label: profile-summaries
+#| message: false
+
+# Raw means
+profile_5_table <- jp |>
+  group_by(LPA_5) |>
+  summarize(
+    Post_Count = n(),
+    Percent_of_Data = round((n() / nrow(jp)) * 100, 1),
+    across(
+      c(WC, Tone, i, we, shehe, they, power, certitude, emo_anger, emo_anx, insight, moral),
+      \(x) mean(x, na.rm = TRUE) |> round(2)
+    )
+  )
+write_csv(profile_5_table, "lpa_profile_5_summary.csv")
+
+# Corpus-standardized (z) means; reported in Table 1
+profile_5z_table <- jp |>
+  mutate(
+    across(
+      c(WC, Tone, i, we, shehe, they, power, certitude, emo_anger, emo_anx, insight, moral),
+      \(x) as.numeric(scale(x))
+    )
+  ) |>
+  group_by(LPA_5) |>
+  summarize(
+    Post_Count = n(),
+    Percent_of_Data = round((n() / nrow(jp)) * 100, 1),
+    across(
+      c(WC, Tone, i, we, shehe, they, power, certitude, emo_anger, emo_anx, insight, moral),
+      \(x) mean(x, na.rm = TRUE) |> round(2)
+    )
+  )
+write_csv(profile_5z_table, "lpa_profile5_zscores.csv")
+
+jp |> count(Theme, sort = TRUE)
+```
+
+## Figure 1: Profile Composition by Theme
+
+```{r}
+#| label: figure-1
+#| message: false
+
+library(scales)
+
+plot_data_clean <- jp |>
+  filter(Theme != "Other") |>
+  count(Theme, LPA_5)
+
+crosstabplot <- ggplot(plot_data_clean, aes(x = Theme, y = n, fill = LPA_5)) +
+  geom_col(position = position_fill(reverse = TRUE), color = "white", linewidth = 0.2) +
+  scale_y_continuous(labels = percent_format()) +
+  scale_x_discrete(labels = function(x) gsub("_", " ", x)) +
+  scale_fill_viridis_d(
+    labels = c(
+      "Group_Baseline" = "Group Baseline",
+      "Hostile_Reactivity" = "Hostile Reactivity",
+      "Anxious_Self-Focus" = "Anxious Self-Focus",
+      "Power-Moral_Framing" = "Impersonal Policing",
+      "Third-Person_Focus" = "Third-Person Focus"
+    ),
+    guide = guide_legend(reverse = TRUE)
+  ) +
+  theme_minimal() +
+  labs(
+    title = "Discourse Profile Composition by Post Theme",
+    x = "Post Theme",
+    y = "Percentage of Posts within Theme",
+    fill = "Discourse Profile"
+  ) +
+  theme(
+    axis.title = element_text(face = "bold"),
+    axis.text.x = element_text(angle = 45, hjust = 1, face = "bold", size = 10, color = "grey20"),
+    axis.text.y = element_text(face = "bold", size = 10, color = "grey20"),
+    legend.text = element_text(size = 9),
+    legend.title = element_text(size = 10, face = "bold"),
+    legend.key.size = unit(0.4, "cm"),
+    plot.title = element_text(face = "bold", size = 14, hjust = 0.5),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor.y = element_blank()
+  )
+
+crosstabplot
+ggsave("Figure_1_Profile_Themes.pdf", plot = crosstabplot, width = 10, height = 6, units = "in")
+```
+
+## Interrupted Time Series
+
+### Setup
+
+Each event is modeled in a 12-month window (six months pre, the event month, five months post) with GLS and an AR(1) error structure. Note that months in which a given series has zero posts do not appear as rows in that series.
+
+```{r}
+#| label: its-setup
+#| message: false
+
+library(nlme)
+
+# Monthly corpus totals (denominators for proportions)
+jp_monthly_totals <- jp |>
+  count(month, name = "total_monthly_posts")
+
+# Events (manuscript Table 3)
+events_list <- list(
+  "1_Book_Release"   = as_date("2018-01-01"),  # 12 Rules for Life, January 2018
+  "2_Absence_Start"  = as_date("2019-11-01"),  # medical withdrawal, November 2019
+  "3_Absence_Return" = as_date("2020-06-01"),  # public reappearance, June 2020
+  "4_Twitter_Ban"    = as_date("2022-06-01")   # Twitter ban, June 2022
+)
+
+run_6mo_windowed_its <- function(df, dependent_var) {
+  event_results <- list()
+
+  for (event_name in names(events_list)) {
+    event_date <- events_list[[event_name]]
+
+    start_date <- event_date %m-% months(6)
+    end_date <- event_date %m+% months(5)
+
+    windowed_data <- df |>
+      filter(month >= start_date & month <= end_date) |>
+      arrange(month) |>
+      mutate(
+        time_seq = row_number(),
+        post_event = ifelse(month >= event_date, 1, 0),
+        time_since_event = ifelse(post_event == 1, time_seq - min(time_seq[post_event == 1]), 0)
+      )
+
+    if (nrow(windowed_data) < 6) next
+
+    f <- as.formula(paste(dependent_var, "~ time_seq + post_event + time_since_event"))
+
+    model <- tryCatch({
+      gls(
+        f,
+        data = windowed_data,
+        correlation = corAR1(form = ~ time_seq),
+        method = "ML",
+        control = glsControl(opt = "optim")
+      )
+    }, error = function(e) NULL)
+
+    if (!is.null(model)) {
+      res_df <- model$dims$N - model$dims$p
+
+      res <- as.data.frame(summary(model)$tTable) |>
+        rownames_to_column(var = "Term") |>
+        mutate(
+          Event = event_name, .before = Term,
+          # t^2 / (t^2 + df_residual) is the squared partial correlation,
+          # reported in the manuscript as pr^2
+          partial_r2 = (`t-value`^2) / (`t-value`^2 + res_df)
+        ) |>
+        rename(Estimate = Value, Std_Error = Std.Error, t_value = `t-value`, p_value = `p-value`)
+
+      event_results[[event_name]] <- res
+    }
+  }
+
+  bind_rows(event_results)
+}
+
+format_its_table <- function(results_df) {
+  results_df |>
+    filter(Term != "(Intercept)") |>
+    group_by(pick(any_of(c("Theme", "LPA_5", "Event")))) |>
+    mutate(
+      Actual_Post_Trend_Pct = round((sum(Estimate[Term == "time_seq"], na.rm = TRUE) +
+                                     sum(Estimate[Term == "time_since_event"], na.rm = TRUE)) * 100, 2)
+    ) |>
+    ungroup() |>
+    mutate(
+      Significance = case_when(
+        p_value < 0.001 ~ "***",
+        p_value < 0.01 ~ "**",
+        p_value < 0.05 ~ "*",
+        TRUE ~ "ns"
+      ),
+      Pct_Point_Shift = round(Estimate * 100, 2),
+      Estimate = round(Estimate, 4),
+      partial_r2 = round(partial_r2, 4),
+      Std_Error = round(Std_Error, 4),
+      p_value = round(p_value, 4)
+    ) |>
+    relocate(Pct_Point_Shift, .after = Estimate) |>
+    relocate(Actual_Post_Trend_Pct, .after = Pct_Point_Shift) |>
+    relocate(partial_r2, .after = Pct_Point_Shift)
+}
+```
+
+### Theme volume
+
+```{r}
+#| label: its-theme-volume
+#| message: false
+
+its_themes <- jp |>
+  drop_na(Theme) |>
+  group_by(month, Theme) |>
+  summarize(theme_count = n(), .groups = "drop") |>
+  left_join(jp_monthly_totals, by = "month") |>
+  mutate(theme_proportion = theme_count / total_monthly_posts) |>
+  group_by(Theme) |>
+  nest()
+
+results_themes <- its_themes |>
+  mutate(
+    model_stats = map(data, possibly(~run_6mo_windowed_its(.x, "theme_proportion"), otherwise = NULL))
+  ) |>
+  select(Theme, model_stats) |>
+  unnest(model_stats) |>
+  format_its_table() |>
+  arrange(Theme, Event, Term)
+
+write_csv(results_themes, "ITS_1_Theme_Volume_6mo.csv")
+```
+
+### Profile volume
+
+```{r}
+#| label: its-profile-volume
+#| message: false
+
+its_profiles <- jp |>
+  drop_na(LPA_5) |>
+  group_by(month, LPA_5) |>
+  summarize(profile_count = n(), .groups = "drop") |>
+  left_join(jp_monthly_totals, by = "month") |>
+  mutate(profile_proportion = profile_count / total_monthly_posts) |>
+  group_by(LPA_5) |>
+  nest()
+
+results_profiles <- its_profiles |>
+  mutate(
+    model_stats = map(data, possibly(~run_6mo_windowed_its(.x, "profile_proportion"), otherwise = NULL))
+  ) |>
+  select(LPA_5, model_stats) |>
+  unnest(model_stats) |>
+  format_its_table() |>
+  arrange(LPA_5, Event, Term)
+
+write_csv(results_profiles, "ITS_2_Profile_Volume_6mo.csv")
+```
+
+### Theme x Profile
+
+```{r}
+#| label: its-theme-x-profile
+#| message: false
+
+# Proportion of each theme WITHIN each profile's monthly posts
+its_cross <- jp |>
+  drop_na(Theme, LPA_5) |>
+  group_by(month, LPA_5, Theme) |>
+  summarize(post_count = n(), .groups = "drop_last") |>
+  mutate(
+    total_monthly_profile_posts = sum(post_count),
+    interaction_proportion = post_count / total_monthly_profile_posts
+  ) |>
+  ungroup() |>
+  group_by(LPA_5, Theme) |>
+  nest()
+
+results_cross <- its_cross |>
+  mutate(
+    model_stats = map(data, possibly(~run_6mo_windowed_its(.x, "interaction_proportion"), otherwise = NULL))
+  ) |>
+  select(LPA_5, Theme, model_stats) |>
+  unnest(model_stats) |>
+  format_its_table() |>
+  arrange(LPA_5, Theme, Event, Term)
+
+write_csv(results_cross, "ITS_3_Theme_x_Profile_6mo.csv")
+```
+
+### Unquestioning Affiliation
+
+Standardized affiliation minus standardized cognitive processing (Ashokkumar & Pennebaker, 2022), averaged by month; effects are in index units.
+
+```{r}
+#| label: its-unquestioning-affiliation
+#| message: false
+
+its_affiliation <- jp |>
+  select(id, month, affiliation, cogproc) |>
+  drop_na(affiliation, cogproc) |>
+  mutate(
+    unquestioning_affiliation = as.numeric(scale(affiliation)) - as.numeric(scale(cogproc))
+  ) |>
+  group_by(month) |>
+  summarize(
+    avg_affiliation_index = mean(unquestioning_affiliation, na.rm = TRUE)
+  )
+
+results_affiliation <- run_6mo_windowed_its(its_affiliation, "avg_affiliation_index") |>
+  format_its_table() |>
+  arrange(Event, Term)
+
+write_csv(results_affiliation, "ITS_4_Unquestioning_Affiliation_6mo.csv")
+```
+
+### Event-effect inclusion criteria
+
+```{r}
+#| label: filter-significant-effects
+#| message: false
+
+effect_threshold <- 0.25  # minimum squared partial correlation (pr^2)
+shift_threshold <- 0.5    # minimum absolute percentage-point shift
+
+apply_thresholds <- function(df) {
+  df |>
+    filter(
+      Significance %in% c("*", "**", "***"),
+      partial_r2 >= effect_threshold,
+      abs(Pct_Point_Shift) >= shift_threshold
+    ) |>
+    relocate(Significance, .after = Pct_Point_Shift) |>
+    relocate(Estimate, .after = Significance)
+}
+
+write_csv(apply_thresholds(results_themes), "ITS_1_Theme_Significant.csv")
+write_csv(apply_thresholds(results_profiles), "ITS_1_Profile_Significant.csv")
+write_csv(apply_thresholds(results_cross), "ITS_1_ThemexProfile_Significant.csv")
+write_csv(apply_thresholds(results_affiliation), "ITS_1_UnquestAff_Significant.csv")
+```
+
+## Macro Trends (2017-2024)
+
+Single-slope GLS/AR(1) models over the full 96-month observation period; `Annualized_Shift` multiplies the monthly slope by 12 and is reported in the manuscript as change per year.
+
+```{r}
+#| label: macro-trends
+#| message: false
+
+run_macro_trend <- function(df, dependent_var) {
+  full_data <- df |>
+    arrange(month) |>
+    mutate(time_seq = row_number())
+
+  f <- as.formula(paste(dependent_var, "~ time_seq"))
+
+  model <- tryCatch({
+    gls(f, data = full_data, correlation = corAR1(form = ~ time_seq), method = "ML",
+        control = glsControl(opt = "optim"))
+  }, error = function(e) NULL)
+
+  if (!is.null(model)) {
+    as.data.frame(summary(model)$tTable) |>
+      rownames_to_column(var = "Term") |>
+      filter(Term == "time_seq") |>
+      rename(Estimate = Value, Std_Error = Std.Error, t_value = `t-value`, p_value = `p-value`) |>
+      mutate(Annualized_Shift = Estimate * 12)
+  }
+}
+
+format_macro_table <- function(results_df) {
+  results_df |>
+    mutate(
+      Significance = case_when(p_value < 0.001 ~ "***", p_value < 0.01 ~ "**",
+                               p_value < 0.05 ~ "*", TRUE ~ "ns"),
+      Estimate = round(Estimate, 5),
+      Std_Error = round(Std_Error, 5),
+      Annualized_Shift = round(Annualized_Shift, 5),
+      p_value = round(p_value, 4)
+    )
+}
+
+# Theme volume
+macro_themes <- jp |>
+  drop_na(Theme) |>
+  group_by(month, Theme) |>
+  summarize(theme_count = n(), .groups = "drop") |>
+  left_join(jp_monthly_totals, by = "month") |>
+  mutate(theme_proportion = theme_count / total_monthly_posts) |>
+  group_by(Theme) |>
+  nest() |>
+  mutate(model_stats = map(data, possibly(~run_macro_trend(.x, "theme_proportion"), otherwise = NULL))) |>
+  select(Theme, model_stats) |>
+  unnest(model_stats) |>
+  format_macro_table() |>
+  arrange(desc(Annualized_Shift))
+
+write_csv(macro_themes, "MacroTrend_1_Theme_Volume.csv")
+
+# Profile volume
+macro_profiles <- jp |>
+  drop_na(LPA_5) |>
+  group_by(month, LPA_5) |>
+  summarize(profile_count = n(), .groups = "drop") |>
+  left_join(jp_monthly_totals, by = "month") |>
+  mutate(profile_proportion = profile_count / total_monthly_posts) |>
+  group_by(LPA_5) |>
+  nest() |>
+  mutate(model_stats = map(data, possibly(~run_macro_trend(.x, "profile_proportion"), otherwise = NULL))) |>
+  select(LPA_5, model_stats) |>
+  unnest(model_stats) |>
+  format_macro_table() |>
+  arrange(desc(Annualized_Shift))
+
+write_csv(macro_profiles, "MacroTrend_2_Profile_Volume.csv")
+
+# Theme x Profile
+macro_cross <- jp |>
+  drop_na(Theme, LPA_5) |>
+  group_by(month, LPA_5, Theme) |>
+  summarize(post_count = n(), .groups = "drop_last") |>
+  mutate(interaction_proportion = post_count / sum(post_count)) |>
+  ungroup() |>
+  group_by(LPA_5, Theme) |>
+  nest() |>
+  mutate(model_stats = map(data, possibly(~run_macro_trend(.x, "interaction_proportion"), otherwise = NULL))) |>
+  select(LPA_5, Theme, model_stats) |>
+  unnest(model_stats) |>
+  format_macro_table() |>
+  arrange(LPA_5, desc(Annualized_Shift))
+
+write_csv(macro_cross, "MacroTrend_3_Theme_x_Profile.csv")
+
+# Unquestioning Affiliation
+macro_affiliation <- jp |>
+  select(id, month, affiliation, cogproc) |>
+  drop_na(affiliation, cogproc) |>
+  mutate(unquestioning_affiliation = as.numeric(scale(affiliation)) - as.numeric(scale(cogproc))) |>
+  group_by(month) |>
+  summarize(avg_affiliation_index = mean(unquestioning_affiliation, na.rm = TRUE)) |>
+  run_macro_trend("avg_affiliation_index") |>
+  format_macro_table()
+
+write_csv(macro_affiliation, "MacroTrend_4_Unquestioning_Affiliation.csv")
+```
